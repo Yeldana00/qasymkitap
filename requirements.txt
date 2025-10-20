@@ -1,0 +1,6 @@
+pandas
+scikit-learn
+python-telegram-bot
+psycopg2-binary
+SQLAlchemy
+python-dotenv

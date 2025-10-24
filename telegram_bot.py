@@ -3,10 +3,10 @@ import pandas as pd
 import psycopg2 # Используем psycopg2 для подключения
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
-    filters, ContextTypes, CallbackQueryHandler
+    filters, ContextTypes
 )
 import logging
 import os
@@ -23,11 +23,14 @@ load_dotenv()
 TOKEN = os.getenv("TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# --- (1) ЗАГРУЗКА ДАННЫХ ИЗ POSTGRES И ПОДГОТОВКА МОДЕЛИ ---
+# --- (1) ЖАҢАРТЫЛҒАН ЛОГИКА: Деректерді жүктеу және модельді дайындау ---
 
 def load_data_from_db():
-    """Загружает данные из PostgreSQL, создает TF-IDF Векторизатор и Матрицу."""
-    
+    """
+    PostgreSQL-ден деректерді жүктейді, дубликаттарды алып тастайды,
+    тақырыптарға салмақ қосады (x3) және TF-IDF моделін дайындайды.
+    Сондай-ақ батырмалар үшін санаттар тізімін қайтарады.
+    """
     if not DATABASE_URL:
         logger.error("Критическая ошибка: DATABASE_URL не найден!")
         exit()
@@ -40,7 +43,10 @@ def load_data_from_db():
         
         logger.info(f"Загружено {len(df)} книг из БД.")
         
-        # --- Подготовка данных ---
+        # --- Деректерді тазалау (test_model.py алынған) ---
+        df = df.drop_duplicates(subset=['Аты'])
+        logger.info(f"Дубликаттар алынып тасталды. Қалғаны: {len(df)} кітап.")
+
         df['Аты'] = df['Аты'].fillna('')
         df['Категория'] = df['Категория'].fillna('Белгісіз')
         df['Толығырақ'] = df['Толығырақ'].fillna('')
@@ -54,60 +60,60 @@ def load_data_from_db():
             'барлық', 'әр', 'көп', 'аз', 'болады'
         ]
         
-        # --- ИЗМЕНЕНИЕ: Создаем и сохраняем Векторизатор (tfidf) ---
         tfidf_vectorizer = TfidfVectorizer(stop_words=kazakh_stop_words)
         
+        # --- Жақсарту (test_model.py алынған) ---
+        logger.info("Улучшение: Применяем веса (Название x3)...")
         df['combined'] = (
-            df['Аты'].str.lower() + ' ' + 
+            (df['Аты'].str.lower() * 3) + ' ' + # <--- УЛУЧШЕНИЕ
             df['Толығырақ'].str.lower() + ' ' + 
             df['Автор'].str.lower() + ' ' + 
             df['Category_Numeric'].astype(str)
         )
         
-        # Обучаем векторизатор и создаем матрицу для ВСЕХ книг
         tfidf_matrix = tfidf_vectorizer.fit_transform(df['combined'])
         
         logger.info("Модель TF-IDF (Векторизатор и Матрица) готова!")
         
-        # Возвращаем DF, Векторизатор и Матрицу
-        return df, tfidf_vectorizer, tfidf_matrix
+        # --- Батырмалар үшін санаттарды алу ---
+        categories = [cat for cat in df['Категория'].unique() if cat != 'Белгісіз']
+        top_categories = sorted(categories)[:9] # Алғашқы 9-ын аламыз (немесе сұрыптаймыз)
+        
+        return df, tfidf_vectorizer, tfidf_matrix, top_categories
 
     except Exception as e:
         logger.error(f"Критическая ошибка при загрузке данных из БД: {e}")
         exit()
 
-# --- Глобальные переменные: загружаем данные 1 раз при старте ---
-# ИЗМЕНЕНИЕ: сохраняем tfidf (векторизатор) и tfidf_matrix
-books_df, tfidf, tfidf_matrix = load_data_from_db()
+# --- Глобалды айнымалылар: 1 рет жүктеу ---
+books_df, tfidf, tfidf_matrix, TOP_CATEGORIES = load_data_from_db()
 
-# --- (2) НОВАЯ ЛОГИКА ПОИСКА ПО КЛЮЧЕВЫМ СЛОВАМ ---
+# --- Тұрақты пернетақтаны құру ---
+# 3x3 тор (grid) жасаймыз
+keyboard_layout = [TOP_CATEGORIES[i:i + 3] for i in range(0, len(TOP_CATEGORIES) - (len(TOP_CATEGORIES) % 3), 3)]
+# Қалған батырмаларды қосамыз
+remaining = TOP_CATEGORIES[len(TOP_CATEGORIES) - (len(TOP_CATEGORIES) % 3):]
+if remaining:
+    keyboard_layout.append(remaining)
+
+PERSISTENT_KEYBOARD = ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
+
+# --- (2) ІЗДЕУ ЖӘНЕ ФОРМАТТАУ ЛОГИКАСЫ ---
 
 def find_books_by_keywords(query: str) -> pd.DataFrame:
     """
-    Ищет книги по ключевым словам из запроса, сравнивая
-    запрос со всеми книгами в tfidf_matrix.
+    Кілттік сөздер бойынша кітаптарды іздейді, TF-IDF моделін қолданады.
+    (Бұл функция енді жаһандық 'tfidf' және 'tfidf_matrix' айнымалыларын пайдаланады)
     """
     try:
         query = query.lower()
-        
-        # 1. Векторизуем текстовый запрос пользователя
-        #    Используем .transform() (не .fit_transform()), 
-        #    так как модель уже обучена
         query_vector = tfidf.transform([query])
-        
-        # 2. Считаем схожесть (cosine similarity) запроса со ВСЕМИ книгами
-        #    (query_vector: 1xN, tfidf_matrix: 177xN) -> (scores: 1x177)
         scores = cosine_similarity(query_vector, tfidf_matrix).flatten()
         
-        # 3. Находим 5 лучших (non-zero) результатов
         if scores.max() == 0:
-            return pd.DataFrame() # Ничего не найдено
+            return pd.DataFrame() # Ештеңе табылмады
 
-        # argsort() сортирует от меньшего к большему
-        # [:-6:-1] берет 5 последних (самых больших) в обратном порядке
         top_indices = scores.argsort()[:-6:-1]
-        
-        # 4. Фильтруем те, у которых 0 схожесть
         top_scores = scores[top_indices]
         valid_indices = top_indices[top_scores > 0]
         
@@ -119,9 +125,8 @@ def find_books_by_keywords(query: str) -> pd.DataFrame:
         logger.error(f"Ошибка в find_books_by_keywords: {e}")
         return pd.DataFrame()
 
-
 def format_book_message(book: pd.Series) -> str:
-    """Форматирует вывод книги (без изменений)"""
+    """Кітап туралы ақпаратты форматтайды (өзгеріссіз)"""
     if pd.notna(book['Бағасы']):
         price = f"{book['Бағасы']:,.0f} тг".replace(',', ' ')
     else:
@@ -137,86 +142,83 @@ def format_book_message(book: pd.Series) -> str:
          message += f"🔗 <a href=\"{book['URL']}\">Сайттан қарау</a>\n"
     return message + "\n"
 
-# --- (3) ОБРАБОТЧИКИ TELEGRAM ---
+# --- (3) TELEGRAM ОБРАБОТЧИКТЕРІ ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик /start (без изменений)"""
+    """
+    /start командасын өңдеуші.
+    Сәлемдесу хабарламасын ЖӘНЕ тұрақты пернетақтаны жібереді.
+    """
     user = update.effective_user
-    categories = [cat for cat in books_df['Категория'].unique() if cat != 'Белгісіз']
-    top_categories = categories[:9] 
-    
-    keyboard = []
-    row = []
-    for category in top_categories:
-        row.append(InlineKeyboardButton(category, callback_data=f"cat_{category}"))
-        if len(row) == 3:
-            keyboard.append(row)
-            row = []
-    if row: keyboard.append(row)
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
     await update.message.reply_html(
         f"Сәлем, {user.mention_html()}! 👋\n\n"
-        f"Төмендегі санатты (категорияны) таңдаңыз, немесе кітап атауын/сипаттамасын жазыңыз:", # "или напишите название/описание книги"
-        reply_markup=reply_markup
+        f"Төмендегі санатты (категорияны) таңдаңыз, немесе кітап атауын/сипаттамасын жазыңыз:",
+        reply_markup=PERSISTENT_KEYBOARD # <--- ЖАҢА ТҰРАҚТЫ ПЕРНЕТАҚТА
     )
+
+async def handle_category_click(category_name: str, update: Update):
+    """
+    Санат батырмасы басылғанда іске қосылады.
+    Осы санаттан кездейсоқ кітаптарды көрсетеді.
+    """
+    logger.info(f"Пользователь выбрал категорию: {category_name}")
+    category_books = books_df[books_df['Категория'] == category_name]
+    
+    if category_books.empty:
+        await update.message.reply_text(f"<b>{category_name}</b> санатында кітаптар табылмады.", parse_mode='HTML')
+        return
+        
+    sample_books = category_books.sample(min(5, len(category_books)))
+    response_message = f"<b>{category_name}</b> санатындағы кездейсоқ кітаптар:\n\n"
+    for _, book in sample_books.iterrows():
+        response_message += format_book_message(book)
+    # Тұрақты пернетақтаны қайта жіберудің қажеті жоқ, ол орнында қалады.
+    await update.message.reply_html(response_message, disable_web_page_preview=True)
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Обрабатывает текстовый запрос пользователя, 
-    ИСПОЛЬЗУЯ НОВУЮ ФУНКЦИЮ ПОИСКА
+    БАРЛЫҚ кіріс мәтінді өңдейді.
+    Мәтіннің батырма немесе іздеу сөзі екенін тексереді.
     """
     query_text = update.message.text
-    logger.info(f"Пользователь ищет по ключам: '{query_text}'")
-    try:
-        # ИЗМЕНЕНИЕ: Вызываем новую функцию
-        found_books = find_books_by_keywords(query_text)
-        
-        if found_books.empty:
-            await update.message.reply_text("Кешіріңіз, осы сөздер бойынша ештеңе табылмады. 😕") # "Sorry, nothing found for these words"
-            return
-            
-        # ИЗМЕНЕНИЕ: Меняем заголовок ответа
-        response_message = f"<b>'{query_text}'</b> сөздері бойынша іздеу нәтижелері:\n\n" # "Search results for the words:"
-        for _, book in found_books.iterrows():
-            response_message += format_book_message(book)
-        await update.message.reply_html(response_message, disable_web_page_preview=True)
-        
-    except Exception as e:
-        logger.error(f"Ошибка при поиске по ключам: {e}")
-        await update.message.reply_text("Ой, бір қателік орын алды.")
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопок (без изменений)"""
-    query = update.callback_query
-    await query.answer()
-    callback_data = query.data
     
-    if callback_data.startswith("cat_"):
-        category_name = callback_data.split("_", 1)[1]
-        logger.info(f"Нажата категория: {category_name}")
-        category_books = books_df[books_df['Категория'] == category_name]
-        
-        if category_books.empty:
-            await query.message.reply_text(f"<b>{category_name}</b> санатында кітаптар табылмады.", parse_mode='HTML')
-            return
+    # ТЕКСЕРУ: Бұл батырма ма, әлде іздеу ме?
+    if query_text in TOP_CATEGORIES:
+        # Егер бұл біздің батырмалардың бірі болса:
+        await handle_category_click(query_text, update)
+    else:
+        # Егер бұл кәдімгі іздеу сөзі болса:
+        logger.info(f"Пользователь ищет по ключам: '{query_text}'")
+        try:
+            found_books = find_books_by_keywords(query_text)
             
-        sample_books = category_books.sample(min(5, len(category_books)))
-        response_message = f"<b>{category_name}</b> санатындағы кездейсоқ кітаптар:\n\n"
-        for _, book in sample_books.iterrows():
-            response_message += format_book_message(book)
-        await query.message.reply_html(response_message, disable_web_page_preview=True)
+            if found_books.empty:
+                await update.message.reply_text("Кешіріңіз, осы сөздер бойынша ештеңе табылмады. 😕")
+                return
+                
+            response_message = f"<b>'{query_text}'</b> сөздері бойынша іздеу нәтижелері:\n\n"
+            for _, book in found_books.iterrows():
+                response_message += format_book_message(book)
+            await update.message.reply_html(response_message, disable_web_page_preview=True)
+            
+        except Exception as e:
+            logger.error(f"Ошибка при поиске по ключам: {e}")
+            await update.message.reply_text("Ой, бір қателік орын алды.")
 
 def main():
-    """Главная функция (без изменений)"""
+    """Болты іске қосу (басты функция)"""
     if not TOKEN:
         logger.error("!!! ТОКЕН НЕ УСТАНОВЛЕН !!!")
         logger.error("Проверьте .env файл или переменные окружения хостинга.")
         return
 
     application = Application.builder().token(TOKEN).build()
+    
+    # Командалар
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button_callback))
+    
+    # 'button_callback' енді қажет емес.
+    # 'handle_text_message' енді бәрін өңдейді (батырмаларды да, іздеуді де).
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     logger.info("Бот запускается...")
@@ -224,3 +226,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -19,17 +19,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Загрузка секретов ---
-# Загружаем переменные из .env (для локального запуска)
-# На хостинге (Railway) переменные будут заданы в интерфейсе
 load_dotenv() 
-
 TOKEN = os.getenv("TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # --- (1) ЗАГРУЗКА ДАННЫХ ИЗ POSTGRES И ПОДГОТОВКА МОДЕЛИ ---
 
 def load_data_from_db():
-    """Загружает данные из PostgreSQL в DataFrame и готовит модель."""
+    """Загружает данные из PostgreSQL, создает TF-IDF Векторизатор и Матрицу."""
     
     if not DATABASE_URL:
         logger.error("Критическая ошибка: DATABASE_URL не найден!")
@@ -37,16 +34,13 @@ def load_data_from_db():
         
     try:
         logger.info("Подключение к PostgreSQL...")
-        # Подключаемся к базе
         with psycopg2.connect(DATABASE_URL) as conn:
-            # Загружаем все данные из таблицы 'books' в pandas DataFrame
             sql = "SELECT * FROM books"
             df = pd.read_sql_query(sql, conn)
         
         logger.info(f"Загружено {len(df)} книг из БД.")
         
-        # --- Дальнейшая логика идентична SQLite ---
-        
+        # --- Подготовка данных ---
         df['Аты'] = df['Аты'].fillna('')
         df['Категория'] = df['Категория'].fillna('Белгісіз')
         df['Толығырақ'] = df['Толығырақ'].fillna('')
@@ -60,7 +54,8 @@ def load_data_from_db():
             'барлық', 'әр', 'көп', 'аз', 'болады'
         ]
         
-        tfidf = TfidfVectorizer(stop_words=kazakh_stop_words)
+        # --- ИЗМЕНЕНИЕ: Создаем и сохраняем Векторизатор (tfidf) ---
+        tfidf_vectorizer = TfidfVectorizer(stop_words=kazakh_stop_words)
         
         df['combined'] = (
             df['Аты'].str.lower() + ' ' + 
@@ -69,35 +64,64 @@ def load_data_from_db():
             df['Category_Numeric'].astype(str)
         )
         
-        tfidf_matrix = tfidf.fit_transform(df['combined'])
-        cosine_sim_matrix = cosine_similarity(tfidf_matrix, tfidf_matrix)
+        # Обучаем векторизатор и создаем матрицу для ВСЕХ книг
+        tfidf_matrix = tfidf_vectorizer.fit_transform(df['combined'])
         
-        logger.info("Модель рекомендаций (TF-IDF) готова!")
+        logger.info("Модель TF-IDF (Векторизатор и Матрица) готова!")
         
-        return df, cosine_sim_matrix
+        # Возвращаем DF, Векторизатор и Матрицу
+        return df, tfidf_vectorizer, tfidf_matrix
 
     except Exception as e:
         logger.error(f"Критическая ошибка при загрузке данных из БД: {e}")
         exit()
 
 # --- Глобальные переменные: загружаем данные 1 раз при старте ---
-books_df, cosine_sim = load_data_from_db()
+# ИЗМЕНЕНИЕ: сохраняем tfidf (векторизатор) и tfidf_matrix
+books_df, tfidf, tfidf_matrix = load_data_from_db()
 
-# --- (2) ЛОГИКА РЕКОМЕНДАЦИЙ (остается без изменений) ---
+# --- (2) НОВАЯ ЛОГИКА ПОИСКА ПО КЛЮЧЕВЫМ СЛОВАМ ---
 
-def get_recommendations(book_title: str) -> pd.DataFrame:
-    book_title = book_title.lower()
-    idx_list = books_df.index[
-        (books_df['Аты'].str.lower().str.contains(book_title, na=False)) | 
-        (books_df['Толығырақ'].str.lower().str.contains(book_title, na=False))
-    ].tolist()
-    
-    if not idx_list: return pd.DataFrame()
-    idx = idx_list[0]
-    top_indices = [i[0] for i in sorted(enumerate(cosine_sim[idx]), key=lambda x: x[1], reverse=True)[1:6]]
-    return books_df.iloc[top_indices]
+def find_books_by_keywords(query: str) -> pd.DataFrame:
+    """
+    Ищет книги по ключевым словам из запроса, сравнивая
+    запрос со всеми книгами в tfidf_matrix.
+    """
+    try:
+        query = query.lower()
+        
+        # 1. Векторизуем текстовый запрос пользователя
+        #    Используем .transform() (не .fit_transform()), 
+        #    так как модель уже обучена
+        query_vector = tfidf.transform([query])
+        
+        # 2. Считаем схожесть (cosine similarity) запроса со ВСЕМИ книгами
+        #    (query_vector: 1xN, tfidf_matrix: 177xN) -> (scores: 1x177)
+        scores = cosine_similarity(query_vector, tfidf_matrix).flatten()
+        
+        # 3. Находим 5 лучших (non-zero) результатов
+        if scores.max() == 0:
+            return pd.DataFrame() # Ничего не найдено
+
+        # argsort() сортирует от меньшего к большему
+        # [:-6:-1] берет 5 последних (самых больших) в обратном порядке
+        top_indices = scores.argsort()[:-6:-1]
+        
+        # 4. Фильтруем те, у которых 0 схожесть
+        top_scores = scores[top_indices]
+        valid_indices = top_indices[top_scores > 0]
+        
+        if len(valid_indices) == 0:
+            return pd.DataFrame()
+            
+        return books_df.iloc[valid_indices]
+    except Exception as e:
+        logger.error(f"Ошибка в find_books_by_keywords: {e}")
+        return pd.DataFrame()
+
 
 def format_book_message(book: pd.Series) -> str:
+    """Форматирует вывод книги (без изменений)"""
     if pd.notna(book['Бағасы']):
         price = f"{book['Бағасы']:,.0f} тг".replace(',', ' ')
     else:
@@ -113,9 +137,10 @@ def format_book_message(book: pd.Series) -> str:
          message += f"🔗 <a href=\"{book['URL']}\">Сайттан қарау</a>\n"
     return message + "\n"
 
-# --- (3) ОБРАБОТЧИКИ TELEGRAM (остаются без изменений) ---
+# --- (3) ОБРАБОТЧИКИ TELEGRAM ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик /start (без изменений)"""
     user = update.effective_user
     categories = [cat for cat in books_df['Категория'].unique() if cat != 'Белгісіз']
     top_categories = categories[:9] 
@@ -132,27 +157,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_html(
         f"Сәлем, {user.mention_html()}! 👋\n\n"
-        f"Төмендегі санатты (категорияны) таңдаңыз, немесе кітап атауын жазыңыз:",
+        f"Төмендегі санатты (категорияны) таңдаңыз, немесе кітап атауын/сипаттамасын жазыңыз:", # "или напишите название/описание книги"
         reply_markup=reply_markup
     )
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    book_title_query = update.message.text
-    logger.info(f"Пользователь ищет: '{book_title_query}'")
+    """
+    Обрабатывает текстовый запрос пользователя, 
+    ИСПОЛЬЗУЯ НОВУЮ ФУНКЦИЮ ПОИСКА
+    """
+    query_text = update.message.text
+    logger.info(f"Пользователь ищет по ключам: '{query_text}'")
     try:
-        recommendations = get_recommendations(book_title_query)
-        if recommendations.empty:
-            await update.message.reply_text("Кешіріңіз, ұсыныстар табылмады. 😕")
+        # ИЗМЕНЕНИЕ: Вызываем новую функцию
+        found_books = find_books_by_keywords(query_text)
+        
+        if found_books.empty:
+            await update.message.reply_text("Кешіріңіз, осы сөздер бойынша ештеңе табылмады. 😕") # "Sorry, nothing found for these words"
             return
-        response_message = f"<b>'{book_title_query}'</b> кітабына ұқсас ұсыныстар:\n\n"
-        for _, book in recommendations.iterrows():
+            
+        # ИЗМЕНЕНИЕ: Меняем заголовок ответа
+        response_message = f"<b>'{query_text}'</b> сөздері бойынша іздеу нәтижелері:\n\n" # "Search results for the words:"
+        for _, book in found_books.iterrows():
             response_message += format_book_message(book)
         await update.message.reply_html(response_message, disable_web_page_preview=True)
+        
     except Exception as e:
-        logger.error(f"Ошибка при поиске: {e}")
+        logger.error(f"Ошибка при поиске по ключам: {e}")
         await update.message.reply_text("Ой, бір қателік орын алды.")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопок (без изменений)"""
     query = update.callback_query
     await query.answer()
     callback_data = query.data
@@ -173,6 +208,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_html(response_message, disable_web_page_preview=True)
 
 def main():
+    """Главная функция (без изменений)"""
     if not TOKEN:
         logger.error("!!! ТОКЕН НЕ УСТАНОВЛЕН !!!")
         logger.error("Проверьте .env файл или переменные окружения хостинга.")
